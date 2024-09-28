@@ -1,0 +1,11 @@
+2024-09-28 13:50:51,430 - ERROR - An error occurred
+Traceback (most recent call last):
+  File "C:\Users\friefrank\Desktop\LCBT\main.py", line 1409, in <module>
+    main()
+  File "C:\Users\friefrank\Desktop\LCBT\main.py", line 1219, in main
+    config.current_enemy_index = get_current_enemy_index()
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\friefrank\Desktop\LCBT\main.py", line 1065, in get_current_enemy_index
+    external_enemy_name = internal_to_external_names.get(config.enemy.name)
+                                                         ^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'name'

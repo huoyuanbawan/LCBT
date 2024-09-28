@@ -1,0 +1,978 @@
+import cv2
+import numpy as np
+import pyautogui
+import win32gui
+import win32con
+import os
+import time
+import keyboard
+import sys
+import tkinter as tk
+import threading
+import logging
+import time
+import signal
+from datetime import datetime
+
+我们已经实现了让ai识别不同的技能图标了（比如Sinclair_s1_down和Ismael_s3_up这些，注意Sinclair_s1_down和Sinclair_s1_up是等效技能，只是一个位置在上一个位置在下），而且也能通过识别技能图标知道其具体位置在哪。
+#以下六行为从左到右，一到六列的技能的范围（例如483,716,578,817的意思就是一个矩阵范围，该矩阵的左上角的横坐标和纵坐标为483和578，右下角的横坐标和纵坐标为578和817），每一列都有上和下两个不同技能。
+#590, 828, 685, 929
+#692, 826, 770, 925
+#788, 825, 854, 924
+#878, 824, 950, 929
+#959, 821, 1045, 927
+#1050, 826, 1143, 927
+
+
+#敌人范围：838,130,1500,685
+
+每个回合开始后，ai要做的就是，从最右列的技能（对应范围943,714,1036,815）开始，依次遍历六列技能。然后我们想要的理想训练结果就是，对于每一列技能，ai能够自己决策到底使用上面的技能还是下面的技能，同时还能将技能拖动到敌人身上。注意，这里我们有多个敌人，ai应该能够识别范围[838,130,1500,685]多个敌人的图标，并且能够将技能拖动到不同的敌人身上，我们理想的结果就是ai能够决定拖到哪个敌人身上最合适。
+等到六列技能都选好敌人了，我们就按下回车键，结束这个回合。等待进入下一个回合。
+
+#人物头像范围：562,961,1184,1038
+放大镜：520,794
+麋鹿的413,608->实际的520, 720
+575。165->688, 340
+x+107，y+112，都加110试试
+
+这个游戏有6个人物——Sinclair，Heathcliff，DonQuixote,HongLu,Ismael,RyoShu。我们要做的是首先在人物头像范围内寻找Sinclair，Heathcliff，DonQuixote,HongLu,Ismael,RyoShu的头像（比如Sinclair对应的头像路径是\img\Sinclair\Sinclair.png），同时记录每个人物对应的坐标。根据横坐标从小到大，依次执行人物对应的函数。
+人物对应的函数——首先通过检测头像上方的区域的技能图标，来分情况讨论，一般来说有三种技能（例如我们看到Sinclair_s1_down，Sinclair_s2_down，Sinclair_s3_down等等），但是一回合内一个人物最多同时拥有一上一下两个技能（可以是同种技能），而且只能使用一个技能。我们要做的是将上面的技能或者下面的技能对准敌人。
+
+头像的坐标是(x, y)，比如(500, 826)，那就检测（x-100, 650, x+100, 800）的范围——479,651,592,783，而对于（1012,826），就检测922,649,1027,784。(x-100, y-150, x+100, y）
+
+不过有一点我想说的是，我们是不是可以在utils.py里面定义这些sinclair_skill_paths和对应的skill_name，这样以后就不用在主程序中再次定义了。
+
+对了，我们这是一个人工智能脚本，如果你还记得的话。所以我们还需要在Sinclair中定义一个决策函数，决定当前回合应该选择上面的还是下面的技能。我们决策所需要的信息，主要是当前角色拥有哪两个技能，可分为四种情况——（两个相同的技能，一技能和二技能，一技能和三技能，二技能和三技能）。我们前面通过detect_skill函数，已经实现了能够识别当前角色有哪些技能了，其中像Sinclair_s1_down和Sinclair_s1_up都是一技能，只是一个位置在上一个位置在下。
+
+然后这个clash标志有六种，    clash_templates = [
+        "img/clash/Dominating.png",
+        "img/clash/Favored.png",
+        "img/clash/Neutral.png",
+        "img/clash/Unopposed.png",
+        "img/clash/Struggling.png",
+        "img/clash/Hopeless.png",
+    ] 其中Dominating和Favored是正面的，也是我们想要的。Neutral是均衡的，Struggling和Hopeless是负面的，是应该避免的。Unopposed跟Neutral差不多。
+你还记得我们这是一个人工智能脚本吗，我们之前已经实现了让脚本选技能，然后依次移动到敌人身上，通常来说每移动到一个新的敌人身上，都会出现上面六个标志之一。而我们最终还是要确定选一个敌人，因此我们可以写一个函数，来让脚本决定到底在让鼠标哪个敌人身上停下并点击选中敌人。
+我们这个函数是这样的，它会计算一个概率，也就是脚本使用当前技能选中当前敌人的概率。这个概率跟多个超参数相关，比如我们上面的clash标志，显然Dominating和Favored对应的概率很高，而Struggling概率很低，Hopeless概率为0，其他情况你也知道怎么处理，每个标志对应一个超参数。然后还会跟我们当前选择的是哪个角色的哪个技能有关，这就涉及多个超参数了。这些超参数由ai学习训练。这个想法怎么样，合理吗？
+
+影响决策的要素：角色速度，当前回合数，角色当前拥有的技能（下回合拥有的技能？），敌人的图标。
+
+与其说是计算概率，不如说我们在计算脚本执行这一步操作的收益。我们可以单独写一个函数，毕竟它涉及很多参数。
+由于最终我们总需要选择一个技能，所以我们会选择收益最高的操作，也就是将技能指定某个敌人，使得最终收益最高。对于任意一个技能指向任一个敌人的收益可以理解成这么一个函数——收益=F（角色，当前回合角色拥有的技能，clash标志，敌人的图标类型，其他要素）。由于每个角色在一回合内，必须让一个技能对准某个敌人，所以我们最后要决定的就只有两个——选择上下哪一个技能，以及对准哪一个敌人。
+
+其实敌人的类型就是从这里的template_name判断：
+    enemy = Enemy("ErlkingHeathcliff", "img/enemies/ErlkingHeathcliff")
+    detected_enemies = enemy.detect_enemy(game_window_image_gray)
+    for enemy_loc, w, h, template_name in detected_enemies:
+
+目前对于这个检测技能的函数我还是不满意，因为要检测的技能图标是半透明的，容易受背景因素的干扰。我们已经能够确定是哪个角色了，一个角色有且仅有三种技能。因此，在Sinclair类中执行这个detect_skills函数的时候，我们只需要比较更像哪一种技能就行了，如果使用匹配的话，可能会因为背景因素干扰而匹配不上。
+    def detect_skills(self, game_window_image_gray):
+        return super().detect_skills(game_window_image_gray, self.skill_names)
+
+    def detect_skills(self, game_window_image_gray, template_names):
+        if self.position is None:
+            print(f"{self.name} 的位置尚未检测到。")
+            return []
+
+        # 定义检测技能的区域
+        x, y = self.position
+        skill_region = game_window_image_gray[y-150:y, x-100:x+100]
+
+        detected_skills = []
+
+        for skill_template, template_name in zip(self.skill_templates, template_names):
+            result = cv2.matchTemplate(skill_region, skill_template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= 0.4)
+            for loc in zip(*locations[::-1]):
+                # 将位置转换为相对于整个游戏窗口的位置
+                global_loc = (loc[0] + x - 100, loc[1] + y - 150)
+                detected_skills.append((global_loc, skill_template.shape[1], skill_template.shape[0], template_name))
+
+        return detected_skills
+
+有问题的：HongLu_s1_up, DonQuixote_s2_down, RyoShu\RyoShu_s1_up，Heathcliff_s3_up
+
+    def detect_skills(self, game_window_image_gray, template_names):
+        if self.position is None:
+            print(f"{self.name} 的位置尚未检测到。")
+            return []
+
+        # 定义检测技能的区域
+        x, y = self.position
+        skill_region = game_window_image_gray[y-150:y, x-100:x+100]
+
+        detected_skills = []
+
+        for skill_template, template_name in zip(self.skill_templates, template_names):
+            result = cv2.matchTemplate(skill_region, skill_template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= 0.59)
+            for loc in zip(*locations[::-1]):
+                # 将位置转换为相对于整个游戏窗口的位置
+                global_loc = (loc[0] + x - 100, loc[1] + y - 150)
+                detected_skills.append((global_loc, skill_template.shape[1], skill_template.shape[0], template_name))
+
+        return detected_skills
+目前我对于character.py类文件中这个detect_skills函数还是不太满意。因为我们都知道每个角色都有独特的技能，在一次函数调用中，我们可以只寻找特定角色的技能，没必要所有角色的技能都遍历一遍，如果要做到这点，我们知道角色的类（比如sinclair.py）是继承自character类的，我们可以在角色的类中实现这个detect_skills函数，然后在调用父类函数的时候把角色信息传递过去就行了。
+除此之外，技能可以分为上下两个部分，由于有时候上面的技能跟下面的技能图标相似，所以可能会混淆。因此我想将skill_region分为上下两个部分，上面的只检测Sinclair_s1_up这类的，下面的只检测Sinclair_s2_down这类的。
+
+我们的main函数的第一部分长这样，现在我需要在获取屏幕截图之后，检测有没有“skip.png”这张图片，它的路径是本目录下的'img\skip.png'，如果有就点击它，然后停顿两秒。
+def main():
+
+    # 获取游戏窗口句柄
+    game_window_handle = win32gui.FindWindow(None, "LimbusCompany")  # 替换成游戏窗口的标题
+    if game_window_handle == 0:
+        print("找不到游戏窗口！")
+        exit()
+
+    # 将游戏窗口置于前台
+    win32gui.SetForegroundWindow(game_window_handle)
+
+    donquixote = DonQuixote()
+    honglu = HongLu()
+    heathcliff = Heathcliff()
+    ryoshu = RyoShu()
+    sinclair = Sinclair()
+    yisang = YiSang()
+    characters = [donquixote, honglu, heathcliff, ryoshu, sinclair, yisang]
+
+    while True:
+        click([400, 770], game_window_handle)
+        # 模拟长按 'q' 键 5 秒钟
+        print("模拟长按 'q' 键 5 秒钟...")
+        pyautogui.keyDown('q')
+        time.sleep(5)  # 持续按下 5 秒
+        pyautogui.keyUp('q')
+        print("长按 'q' 键结束。")
+        
+        # 截取游戏窗口的截图
+        left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+        width = right - left
+        height = bottom - top
+        game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+        # 使用OpenCV加载游戏窗口截图
+        game_window_image = np.array(game_window_screenshot)
+        game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+目前我们这个函数是这样：
+def detect_and_handle_skip(game_window_image_gray, game_window_handle):
+    skip_template_path = 'img/skip.png'
+    skip_template = cv2.imread(skip_template_path, cv2.IMREAD_GRAYSCALE)
+    detect_region = game_window_image_gray[350:450, 650:850]
+    if skip_template is not None:
+        result = cv2.matchTemplate(detect_region, skip_template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        threshold = 0.8  # 匹配阈值，可以根据需要调整
+        if max_val >= threshold:
+            skip_x, skip_y = max_loc[0] + skip_template.shape[1] // 2, max_loc[1] + skip_template.shape[0] // 2
+            click([skip_x + 650, skip_y + 350], game_window_handle)
+            time.sleep(2)
+            return True
+    return False
+
+然后我现在将skip.png放到本目录下的'img\event\skip.png'，我们这个函数再做以下修改：检测到skip后点击skip，然后停顿一秒，重新截取画面。然后检测新的画面的范围(0,750 ， 700,850)内有没有"img\event\normal.png"、"img\event\high.png"、"img\event\veryhigh.png"的图片，如果有的话就依次点击，最后再停顿一秒。
+
+它的返回值是最后截取到的游戏画面
+因为我们是依次点击，所以检测到并点击了一个图标后，不用退出循环，继续循环下去。然后我希望把这个函数做成一个循环，每次循环开始都会先截取画面，然后检测有没有skip..png，如果没有返回当前画面。如果有，就执行以下操作——点击skip，停顿一秒，重新截取画面。然后检测新的画面的范围(0,750 ， 700,850)内有没有"img\event\normal.png"、"img\event\high.png"、"img\event\veryhigh.png"的图片，如果有的话就依次点击，再停顿一秒。重新截取画面，检测画面右下角[1250,750， 1580,900]有没有'img\event\commence'，有的话就点击。
+
+我希望如果没有找到技能的话，就执行一个二次确认的函数。它的作用是首先将鼠标移动到nearest_coordinate对应的坐标上，然后600,80  800,200
+
+我这段代码发生了报错：
+def battling(game_window_handle, battling_image):
+    
+    # 截取游戏窗口的截图
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+    # 使用OpenCV加载游戏窗口截图
+    game_window_image = np.array(game_window_screenshot)
+    # 转换为灰度图像
+    game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)
+
+    search_region = game_window_image_gray[700:800, 350:450]
+
+    result = cv2.matchTemplate(search_region, battling_image, cv2.TM_CCOEFF_NORMED)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+    if max_val >= 0.8:
+        print('已经找到了放大镜！')                                          
+        click(max_loc, game_window_handle)                                              
+        # 模拟长按 'q' 键 3 秒钟
+        print("模拟长按 'q' 键 3 秒钟...")
+        pyautogui.keyDown('q')
+        time.sleep(3)  # 持续按下 3 秒
+        pyautogui.keyUp('q')
+        print("长按 'q' 键结束。")
+
+(myenv) C:\Users\Administrator\Desktop\LCBT>python test_target.py
+未检测到敌人。
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\LCBT\test_target.py", line 283, in <module>
+    main()
+  File "C:\Users\Administrator\Desktop\LCBT\test_target.py", line 242, in main
+    battling(game_window_handle, battling_image)
+  File "C:\Users\Administrator\Desktop\LCBT\test_target.py", line 117, in battling
+    result = cv2.matchTemplate(search_region, battling_image, cv2.TM_CCOEFF_NORMED)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+cv2.error: OpenCV(4.9.0) D:\a\opencv-python\opencv-python\opencv\modules\imgproc\src\templmatch.cpp:1164: error: (-215:Assertion failed) (depth == CV_8U || depth == CV_32F) && type == _templ.type() && _img.dims() <= 2 in function 'cv::matchTemplate'
+
+我目前这个函数是这样的，然后我希望比较一下要检测的区域内的标志更接近于default_magnifier_image还是used_magnifier_image，如果更接近于前者，就执行click((max_loc[0] + 350, max_loc[1] + 700), game_window_handle)  ，否则就不用执行。其他部分不变，也就是两种情况下都要长按q键三秒；
+def battling(game_window_handle, default_magnifier_image, used_magnifier_image):
+    
+    # 截取游戏窗口的截图
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+    # 使用OpenCV加载游戏窗口截图
+    game_window_image = np.array(game_window_screenshot)
+    game_window_image = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2BGR)
+
+    search_region = game_window_image[700:800, 350:450]
+
+    result = cv2.matchTemplate(search_region, battling_image, cv2.TM_CCOEFF_NORMED)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+    if max_val >= 0.6:
+        print('已经找到了放大镜！')                                          
+        click((max_loc[0] + 350, max_loc[1] + 700), game_window_handle)                                              
+        # 模拟长按 'q' 键 3 秒钟
+        print("模拟长按 'q' 键 3 秒钟...")
+        pyautogui.keyDown('q')
+        time.sleep(3)  # 持续按下 3 秒
+        pyautogui.keyUp('q')
+        print("长按 'q' 键结束。")
+        return True
+    else:
+        print('找不到放大镜！')
+        return False
+
+对了，这个函数，能不能每次执行的时候，都截图 skill_region = game_window_image_gray[80:200, 600:800]给我看？：
+    def detect_skills_again(self, position, game_window_handle, top_skill_templates, template_names, skill_range):
+        moveTo(position, game_window_handle)
+        left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+        width = right - left
+        height = bottom - top
+        game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+        
+        # 使用OpenCV加载游戏窗口截图
+        game_window_image = np.array(game_window_screenshot)
+        game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+        skill_region = game_window_image_gray[80:200, 600:800]
+
+        best_skill = None
+        best_val = 0
+        
+        for i in range(len(top_skill_templates)):
+            result = cv2.matchTemplate(skill_region, top_skill_templates[i], cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(result)
+            print('top_skill=', template_names[i], 'max_val=', max_val)
+            if max_val >= 0.5 and max_val > best_val:
+                best_val = max_val
+                index = i + skill_range
+                if i + skill_range >= len(template_names):
+                    index -= 5
+                best_skill = (position, top_skill_templates[i].shape[1], top_skill_templates[i].shape[0], template_names[index])
+                if config.already_activate_HongLu_dodge is False and template_names[index].startswith('HongLu\\HongLu_s3'):
+                    print('Activate_HongLu_dodge')
+                    config.activate_HongLu_dodge = True
+
+        if best_skill:
+            print('二次确定技能成功')
+        else:
+            print('二次确定技能失败')
+            return None
+        return best_skill
+
+我这个循环长这个样子，在执行完detected_enemies.insert(0, detected_enemies.pop(i))后，当前的enemy_loc, w, h, template_name就不是对应的detected_enemies[i]了，所以有没有办法回退到循环的上一次？
+def handle_enemies(detected_enemies, game_window_handle):
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+    for enemy_loc, w, h, template_name in detected_enemies:
+        print(f"检测到敌人0: {template_name} 位置: {enemy_loc}")
+
+    for i, (enemy_loc, w, h, template_name) in enumerate(detected_enemies):
+        if template_name.startswith('blind_obsession') or template_name.startswith('head_butt'):
+        # 模拟长按 'd' 键 1 秒钟
+            print("模拟长按 'd' 键 1 秒钟...")
+            pyautogui.keyDown('d')
+            time.sleep(1)  # 持续按下 1 秒
+            pyautogui.keyUp('d')
+            print("长按 'd' 键结束。")
+            time.sleep(1)
+            game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+            # 使用OpenCV加载游戏窗口截图
+            game_window_image = np.array(game_window_screenshot)
+            # 转换为灰度图像
+            game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)
+                
+            # 创建Enemy对象
+            enemy = Enemy("DreamDevouring", "img/enemies/DreamDevouring")
+
+            # 检测敌人
+            detected_enemies = enemy.detect_enemy(game_window_image_gray)
+
+        if template_name.startswith('draining_roots') and sorted_characters[0].detect_dodge(game_window_image_gray) is False: 
+            moveTo([1010, 855], game_window_handle)
+            click([1010, 855], game_window_handle)
+
+        if template_name.startswith('green_slime') and enemy_loc[1] < 150:
+            detected_enemies[i] = (enemy_loc, w, h, 'pearl_head0')
+            template_name = 'pearl_head0'
+
+        if template_name.startswith('pearl_head') and enemy_loc[1] > 150:
+            detected_enemies[i] = (enemy_loc, w, h, 'green_slime0')
+            template_name = 'green_slime0'
+
+        if template_name.startswith('green_slime') and enemy_loc[1] > 300 and enemy_loc[1] < 400:
+            detected_enemies.insert(0, detected_enemies.pop(i))
+            i -= 1
+            continue
+
+        if template_name.startswith('stagger'):
+            pyautogui.press('p')
+            pyautogui.press('p')
+            detected_enemies = []
+            break
+
+        if template_name.startswith('flourishing_gosstpium') or template_name.startswith('effervescent_green_slime') or template_name.startswith('9_2'):
+            sorted_characters[4].use_ego_skill(game_window_handle, sorted_characters[4].ego_templates, 0)
+            sorted_characters[5].use_ego_skill(game_window_handle, sorted_characters[5].ego_templates, 0)
+            break
+                
+                
+                
+    for enemy_loc, w, h, template_name in detected_enemies:
+        print(f"检测到敌人1: {template_name} 位置: {enemy_loc}")
+
+想写个函数，检测当前画面中有没有能够匹配当前目录下'img\restart'中的png图片文件，如果有，就执行重开操作——                
+	pyautogui.press('esc')
+                time.sleep(1)
+                click((820, 500), game_window_handle)
+                config.activate_HongLu_dodge = False
+                print('HongLu激活防备已经关闭')
+
+头：112，第一回合：349。粘液：上：219. 中：372.    下：473
+
+看到这个，我突然想起来character.py中也有个类似的函数：
+def load_template(template_path):
+    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+    if template is None:
+        print(f"未能读取模板图像：{template_path}")
+    return template
+我在想我们是不是可以把这种函数放在一个utils.py文件里
+
+    "Sinclair_s1": 1.0,
+    "Sinclair_s2": 0.8,
+    "Sinclair_s3": 0.67,
+    "Sinclair_dodge": 0.0,
+    "Sinclair_branch": 1.0,
+    "Heathcliff_s1": 1.0,
+    "Heathcliff_s2": 0.8,
+    "Heathcliff_s3": 0.67,
+    "Heathcliff_dodge": 0.0,
+    "Heathcliff_bodysack": 1.2,
+    "Ismael_s1": 1.0,
+    "Ismael_s2": 0.8,
+    "Ismael_s3": 0.7,
+    "Ismael_dodge": 0.0,
+    "YiSang_s1": 1.0,
+    "YiSang_s2": 0.8,
+    "YiSang_s3": 0.76,
+    "YiSang_defend": 0.0,
+    "YiSang_crow": 1.2,
+    "RyoShu_s1": 1.0,
+    "RyoShu_s2": 0.8,
+    "RyoShu_s3": 0.6,
+    "RyoShu_dodge": 0.0,
+    "RyoShu_forest": 1.2,
+    "DonQuixote_s1": 1.0,
+    "DonQuixote_s2": 0.8,
+    "DonQuixote_s3": 0.6,
+    "DonQuixote_dodge": 0.0,
+    "DonQuixote_la": 1.2,
+    "HongLu_s1": 1.0,
+    "HongLu_s2": 0.8,
+    "HongLu_s3": 0.5,
+    "HongLu_land": 1.2,
+    "HongLu_dodge": 0.0
+
+没拼点的：1，已经拼点的：0.5.
+
+def move_to_enemy_positions_and_select(detected_enemies, game_window_handle, skills, enemy_skill_counts):
+    best_enemy_position = None
+    best_enemy_name = None
+    best_skill = None
+    best_skill_position = None
+    highest_reward = 0
+
+
+    for skill in skills:
+        skill_position, w, h, template_name = skill
+        skill_name = os.path.basename(template_name).split(".")[0]  # 提取技能名称
+
+        # 点击技能位置
+        click(skill_position, game_window_handle)
+
+        for i, (enemy_loc, w, h, enemy_template_name) in enumerate(detected_enemies):
+            # 检查是否按下了 'q' 键
+            if keyboard.is_pressed('q'):
+                print("检测到 'q' 键按下，程序结束。")
+                sys.exit()  # 终止整个程序
+            enemy_type = os.path.basename(enemy_template_name).split(".")[0]
+            x, y = enemy_loc
+            moveTo([x + enemy_offset_x, y + enemy_offset_y], game_window_handle)  # 移动鼠标到敌人位置
+
+            left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+            width = right - left
+            height = bottom - top
+            game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+        
+            # 使用OpenCV加载游戏窗口截图
+            game_window_image = np.array(game_window_screenshot)
+            game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+            game_window_image_gray = game_window_image_gray[0:70, 725:875]
+            
+            # 截取感兴趣区域
+            roi = game_window_image_gray[0:70, 725:875]
+            cv2.imwrite('roi_screenshot.png', roi)  # 保存截取区域的图像
+            
+            # 检测画面上方区域是否有匹配的标志
+            detected_clash_sign = detect_clash_sign(game_window_image_gray)
+
+            # 计算当前组合的收益
+            if detected_clash_sign:
+                current_reward = calculate_reward(skill_name, detected_clash_sign, enemy_type, enemy_skill_counts, i)
+                print(f"检测到标志: {detected_clash_sign}, 技能: {skill_name}, 敌人: {enemy_type}, 敌人位置: {enemy_loc}, 收益: {current_reward}")
+                if current_reward > highest_reward:
+                    highest_reward = current_reward
+                    best_enemy_position = (x, y)
+                    best_enemy_name = enemy_template_name
+                    best_skill = skill_name
+                    best_skill_position = skill_position
+                    best_enemy_index = i
+
+        # 在遍历技能列表的末尾添加右键点击
+        right_click([200, 50], game_window_handle)
+        time.sleep(0.2)
+
+    if best_enemy_position and best_skill and best_skill_position:
+        click(best_skill_position, game_window_handle)  # 点击最佳技能位置
+        click([best_enemy_position[0] + enemy_offset_x, best_enemy_position[1] + enemy_offset_y], game_window_handle)
+        print(f"选择的最佳敌人位置: {best_enemy_position}, 敌人类型:{best_enemy_name}, 使用技能: {best_skill}")
+        # 更新被选中敌人的技能计数
+        if best_enemy_name.startswith('candle') and(best_skill.startswith('RyoShu_s1') or best_skill.startswith('DonQuixote_s1') or best_skill.startswith('Heathcliff_s1')):
+            pass
+        else:
+            enemy_skill_counts[best_enemy_index] += 1
+    else:
+        print("没有找到合适的敌人或技能组合。")
+
+对于以下这个函数：
+def detect_and_handle_skip(game_window_handle, is_ArdorBlossomMoth):
+    skip_template_path = 'img/event/skip.png'
+    skip_template = cv2.imread(skip_template_path, cv2.IMREAD_GRAYSCALE)
+
+
+    event_templates = {
+        "verylow": "img/event/verylow.png",
+        "low": "img/event/low.png",
+        "normal": "img/event/normal.png",
+        "high": "img/event/high.png",
+        "veryhigh": "img/event/veryhigh.png",
+    }
+        
+    threshold = 0.8  # 匹配阈值，可以根据需要调整
+
+    while True:
+        # 检查是否按下了 'q' 键
+        if keyboard.is_pressed('q'):
+            print("检测到 'q' 键按下，程序结束。")
+            sys.exit()  # 终止整个程序
+        # 截取游戏窗口的截图
+        left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+        width = right - left
+        height = bottom - top
+        game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+        # 使用OpenCV加载游戏窗口截图
+        game_window_image = np.array(game_window_screenshot)
+        game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+        detect_region = game_window_image_gray[350:450, 650:850]
+
+        if skip_template is not None:
+            result = cv2.matchTemplate(detect_region, skip_template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+            if max_val >= threshold:
+                skip_x, skip_y = max_loc[0] + skip_template.shape[1] // 2, max_loc[1] + skip_template.shape[0] // 2
+                click([skip_x + 650, skip_y + 350], game_window_handle)
+                time.sleep(1)
+
+                # 重新截取游戏窗口的截图
+                game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+                # 使用OpenCV加载新的游戏窗口截图
+                new_game_window_image = np.array(game_window_screenshot)
+                new_game_window_image_gray = cv2.cvtColor(new_game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+                # 检查是否为小于等于阈值事件
+                
+                # 在新的截图范围内检测并点击指定图片
+                detect_region = new_game_window_image_gray[750:850, 0:700]
+                for event_name, template_path in event_templates.items():
+                    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+                    if template is not None:
+                        result = cv2.matchTemplate(detect_region, template, cv2.TM_CCOEFF_NORMED)
+                        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                        if max_val >= threshold:
+                            event_x, event_y = max_loc[0] + template.shape[1] // 2, max_loc[1] + template.shape[0] // 2
+                            click([event_x, event_y + 750], game_window_handle)
+                click([1420, 820], game_window_handle)
+            else:
+                return game_window_image_gray
+        else:
+            return game_window_image_gray
+我需要你在检查是否为小于等于阈值事件那里补充代码，在截图区域[950,500,  1100,600]内寻找当前目录下的img\event\less_than_threshold图片，如果找到了，就令
+    event_templates = {
+        "veryhigh": "img/event/veryhigh.png",
+        "high": "img/event/high.png",
+        "normal": "img/event/normal.png",
+        "low": "img/event/low.png",
+        "verylow": "img/event/verylow.png",
+    }
+
+目前对于这个函数，我希望在最后所有匹配值都不超过阈值的时候，进行二次确认。为此我们要写一个二次确认的函数detech_clash_sign_again(game_window_handle, clash_templates) 。这个二次确认的函数跟第一次确认差不多，只不过这次我认为可以不转换成灰度图像，而是采用有色图像进行检测？或者你认为还有别的更好的办法检测吗，因为我这里因为背景颜色有干扰导致识别不准确，而且我要识别的是两个单词——红色的'Hopeless'和黄白的'Unopposed'
+def detect_clash_sign(game_window_handle):
+    clash_templates = [
+        "img/clash/Dominating0.png",
+        "img/clash/Favored0.png",
+        "img/clash/Neutral0.png",
+        "img/clash/Unopposed0.png",
+        "img/clash/Struggling0.png",
+        "img/clash/Hopeless0.png",
+        "img/clash/Hopeless1.png",
+        "img/clash/Hopeless2.png",
+        "img/clash/Hopeless3.png",
+    ]
+    
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+        
+    # 使用OpenCV加载游戏窗口截图
+    game_window_image = np.array(game_window_screenshot)
+    game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+    game_window_image_gray = game_window_image_gray[0:70, 725:875]
+
+    clash_template_images = [cv2.imread(template_path, cv2.IMREAD_GRAYSCALE) for template_path in clash_templates]
+
+    best_match = 'Unopposed'
+    best_match_value = 0.0
+    match_values = {}
+
+    for template_image, template_name in zip(clash_template_images, clash_templates):
+        result = cv2.matchTemplate(game_window_image_gray, template_image, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        template_base_name = os.path.basename(template_name).split(".")[0][:-1]
+        match_values[template_base_name] = max_val
+        print('clash_sign=', template_base_name, ' max_val=', max_val)
+        if max_val >= 0.6 and max_val > best_match_value:
+            best_match_value = max_val
+            best_match = template_base_name
+
+    if best_match_value == 0.0:
+        best_match = detech_clash_sign_again(game_window_handle, clash_templates) 
+
+
+    return best_match
+
+这个函数我想搞的复杂一点，可以这样，目前我们已经知道当前目录下的img\restart里有三幅图片——dead0.png, stagger0.png, stagger1.png，后面两张都是同一类型stagger的，只不过样子不太一样。我们要实现的是这样:对于dead0，如果检测到dead0，就重开。对于stagger，如果当前检测到的stagger大于等于3个，我们也重开。注意，检测stagger的时候为了避免重复计数，要合并位置差不多的，或者对位置差不多的只记一次，位置差不多指的是横纵坐标相差绝对值都小于等于30：
+def detect_and_restart(game_window_handle):
+    restart_folder = 'img/restart'
+    restart_templates = load_templates(restart_folder)
+
+    # 截取游戏窗口的截图
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+    # 使用OpenCV加载游戏窗口截图
+    game_window_image = np.array(game_window_screenshot)
+    game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+    for template_name, template in restart_templates.items():
+        result = cv2.matchTemplate(game_window_image_gray, template, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        threshold = 0.8  # 设定匹配阈值，根据需要调整
+
+        if max_val >= threshold:
+            print(f"找到匹配的重开图片: {template_name}")
+            perform_restart(game_window_handle)
+            return True
+
+    return False
+
+你还记得这个函数吗，它有一个变量叫enemy_skill_counts，记录了每个敌人同时被多少个技能选中。现在我不仅想要记录数量信息，我还要记录技能类型，敌人类型，敌人位置，clash标志。如果之前的clash标志比现在的好，那就再执行之前的技能一次。然后计算收益的时候，也要根据之前的技能类型进行计算？比如兔子s3和双ws3，
+
+def move_to_enemy_positions_and_select(detected_enemies, game_window_handle, skills, enemy_skill_counts):
+    best_enemy_position = None
+    best_enemy_name = None
+    best_skill = None
+    best_skill_position = None
+    best_clash_sign = None
+    highest_reward = 0
+    
+
+
+    for skill in skills:
+        skill_position, w, h, template_name = skill
+        skill_name = os.path.basename(template_name).split(".")[0]  # 提取技能名称
+
+        # 点击技能位置
+        click(skill_position, game_window_handle)
+
+        for i, (enemy_loc, w, h, enemy_template_name) in enumerate(detected_enemies):
+            # 检查是否按下了 'q' 键
+            if keyboard.is_pressed('q'):
+                print("检测到 'q' 键按下，程序结束。")
+                sys.exit()  # 终止整个程序
+            enemy_type = os.path.basename(enemy_template_name).split(".")[0]
+            x, y = enemy_loc
+            moveTo([x + enemy_offset_x, y + enemy_offset_y], game_window_handle)  # 移动鼠标到敌人位置
+
+            left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+            width = right - left
+            height = bottom - top
+            game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+        
+            # 使用OpenCV加载游戏窗口截图
+            game_window_image = np.array(game_window_screenshot)
+            game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+            game_window_image_gray = game_window_image_gray[0:70, 725:875]
+            
+            
+            # 检测画面上方区域是否有匹配的标志
+            detected_clash_sign = detect_clash_sign(game_window_image_gray, game_window_handle)
+
+            # 计算当前组合的收益
+            if detected_clash_sign:
+                current_reward = calculate_reward(skill_name, detected_clash_sign, enemy_type, enemy_skill_counts, i)
+                print(f"检测到标志: {detected_clash_sign}, 技能: {skill_name}, 敌人: {enemy_type}, 敌人位置: {enemy_loc}, 收益: {current_reward}")
+                if current_reward > highest_reward:
+                    highest_reward = current_reward
+                    best_enemy_position = (x, y)
+                    best_enemy_name = enemy_template_name
+                    best_skill = skill_name
+                    best_skill_position = skill_position
+                    best_clash_sign = detected_clash_sign
+                    best_enemy_index = i
+
+        # 在遍历技能列表的末尾添加右键点击
+        right_click([200, 50], game_window_handle)
+        time.sleep(0.2)
+
+    if best_enemy_position and best_skill and best_skill_position:
+        click(best_skill_position, game_window_handle)  # 点击最佳技能位置
+        click([best_enemy_position[0] + enemy_offset_x, best_enemy_position[1] + enemy_offset_y], game_window_handle)
+        print(f"选择的最佳敌人位置: {best_enemy_position}, 敌人类型:{best_enemy_name}, 使用技能: {best_skill}")
+        # 更新被选中敌人的技能计数
+        if best_enemy_name.startswith('candle') and(best_skill.startswith('RyoShu_s1') or best_skill.startswith('DonQuixote_s1') or best_skill.startswith('Heathcliff_s1')) or best_clash_sign.startswith('Struggling') or best_clash_sign.startswith('Hopeless'):
+            pass
+        else:
+            skill_enemy_situation[
+            enemy_skill_counts[best_enemy_index] += 1
+        for skill_name, skill_position, enemy_name, enemy_position, clash_sign in skill_enemy_situation:
+            if reward_params[clash_sign] > reward_params[best_clash_sign]:
+                click(skill_position, game_window_handle)  # 点击最佳技能位置
+                click([enemy_position[0] + enemy_offset_x, enemy_position[1] + enemy_offset_y], game_window_handle)
+                best_clash_sign = 'Unopposed'
+            else :
+                skill_enemy_situation = (skill_name, skill_position, enemy_name, enemy_position, 'Unopposed')
+
+                
+        skill_enemy_situation.append((best_skill, best_skill_position, best_enemy_name, best_enemy_position, best_clash_sign))
+    else:
+        print("没有找到合适的敌人或技能组合。")
+
+    for the_skill_name, _, the_enemy_name, the_enemy_position, the_clash_sign in skill_enemy_situation:
+        if the_enemy_position == enemy_position:
+            if not(the_enemy_name.startswith('candle') and ((skill_name.startswith('RyoShu_s1') or skill_name.startswith('DonQuixote_s1') or skill_name.startswith('Heathcliff_s1')) or clash_sign.startswith('Struggling') or clash_sign.startswith('Hopeless')):
+我这里报错了：
+    if not(the_enemy_name.startswith('candle') and ((skill_name.startswith('RyoShu_s1') or skill_name.startswith('DonQuixote_s1') or skill_name.startswith('Heathcliff_s1')) or clash_sign.startswith('Struggling') or clash_sign.startswith('Hopeless')):
+                                                                                                                                                                                                                                                         ^
+SyntaxError: invalid syntax
+
+ui.py中的代码需不需要修改
+# ui.py
+import tkinter as tk
+from tkinter import ttk, messagebox
+from enemy_class.enemy import Enemy
+from config import enemy_options, enemy_image_paths, internal_enemy_names
+
+class EnemySelectorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("选择敌人")
+
+        # 创建标签
+        self.label = ttk.Label(root, text="请选择一个敌人:")
+        self.label.pack(pady=10)
+
+        # 创建下拉菜单
+        self.selected_enemy = tk.StringVar()
+        self.combobox = ttk.Combobox(root, textvariable=self.selected_enemy)
+        self.combobox['values'] = enemy_options
+        self.combobox.pack(pady=10)
+
+        # 创建确认按钮
+        self.button = ttk.Button(root, text="确定", command=self.on_select)
+        self.button.pack(pady=10)
+
+        self.selected_enemy_obj = None
+
+    def on_select(self):
+        selected_enemy_display_name = self.selected_enemy.get()
+        if selected_enemy_display_name in enemy_image_paths:
+            enemy_image_path = enemy_image_paths[selected_enemy_display_name]
+            internal_enemy_name = internal_enemy_names[selected_enemy_display_name]
+            self.selected_enemy_obj = Enemy(internal_enemy_name, enemy_image_path)
+            print(f"已选择敌人: {self.selected_enemy_obj.name}, 路径: {self.selected_enemy_obj.templates_folder}")
+            self.root.quit()
+        else:
+            messagebox.showerror("错误", "选择的敌人不在列表中，请重新选择。")
+
+    def get_selected_enemy(self):
+        return self.selected_enemy_obj
+
+然后config.py里的参数是这样的：
+enemy_options = [
+    "第一站-齿轮", "第二站-波浪", "第三站-怀旧", "第五站-苦行", 
+    "第六站-真理", "第七站-羽化", "第九站-白化", "第十站-洗脑", 
+    "第十一站-煤灯", "最终战-螺旋"
+]
+
+enemy_image_paths = {
+    "第一站-齿轮": "img/enemies/Mermaid",
+    "第二站-波浪": "img/enemies/DreamDevouring",
+    "第三站-怀旧": "img/enemies/Gossypium",
+    "第五站-苦行": "img/enemies/Pearl",
+    "第六站-真理": "img/enemies/SkinProphet",
+    "第七站-羽化": "img/enemies/ArdorBlossomMoth",
+    "第九站-白化": "img/enemies/PirateAndMermaid",
+    "第十站-洗脑": "img/enemies/BrainWash",
+    "第十一站-煤灯": "img/enemies/Gaslight",
+    "最终战-螺旋": "img/enemies/Spiral"
+}
+
+internal_enemy_names = {
+    "第一站-齿轮": "Mermaid",
+    "第二站-波浪": "DreamDevouring",
+    "第三站-怀旧": "Gossypium",
+    "第五站-苦行": "Pearl",
+    "第六站-真理": "SkinProphet",
+    "第七站-羽化": "ArdorBlossomMoth",
+    "第九站-白化": "PirateAndMermaid",
+    "第十站-洗脑": "BrainWash",
+    "第十一站-煤灯": "Gaslight",
+    "最终战-螺旋": "Spiral"
+
+在enemy_class的enemy.py文件长这样，有需要修改的地方吗，比如load_enemy_templates函数好像读取了图片路径？
+# enemy_class/enemy.py
+import cv2
+import os
+import numpy as np
+
+class Enemy:
+    def __init__(self, name, templates_folder):
+        self.name = name
+        self.templates_folder = templates_folder
+
+    def detect_enemy(self, game_window_image_gray):
+        enemy_templates = self.load_enemy_templates()
+        detected_enemies = []
+
+        for template_name, template_path in enemy_templates.items():
+            template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+            if template is None:
+                print(f"未能读取模板图像：{template_path}")
+                continue
+
+            result = cv2.matchTemplate(game_window_image_gray, template, cv2.TM_CCOEFF_NORMED)
+            locations = np.where(result >= 0.65)
+            for loc in zip(*locations[::-1]):
+                detected_enemies.append((loc, template.shape[1], template.shape[0], template_name, result[loc[1], loc[0]]))
+
+        # 合并位置相近的敌人
+        merged_enemies = self.merge_close_enemies(detected_enemies)
+
+        return merged_enemies
+
+    def merge_close_enemies(self, detected_enemies, threshold=40):
+        if not detected_enemies:
+            return []
+
+        merged_enemies = []
+        used = [False] * len(detected_enemies)
+
+        for i, (loc1, w1, h1, template_name1, score1) in enumerate(detected_enemies):
+            if used[i]:
+                continue
+
+            merged_enemy = (loc1, w1, h1, template_name1, score1)
+            for j, (loc2, w2, h2, template_name2, score2) in enumerate(detected_enemies):
+                if i != j and not used[j]:
+                    if abs(loc1[0] - loc2[0]) <= threshold and abs(loc1[1] - loc2[1]) <= threshold:
+                        if score2 > score1:
+                            merged_enemy = ((loc1[0] + loc2[0]) // 2, (loc1[1] + loc2[1]) // 2), w2, h2, template_name2, score2
+                        used[j] = True
+            used[i] = True
+            merged_enemies.append(merged_enemy)
+
+        # 去掉分数，只保留位置和模板信息
+        merged_enemies = [(loc, w, h, template_name) for loc, w, h, template_name, score in merged_enemies]
+
+        return merged_enemies
+
+    def load_enemy_templates(self):
+        enemy_templates = {}
+        for root, dirs, files in os.walk(self.templates_folder):
+            for file in files:
+                if file.endswith(".png"):
+                    template_name = os.path.splitext(file)[0]
+                    enemy_templates[template_name] = os.path.join(root, file)
+        return enemy_templates
+
+我给你看一下我目前各个文件用到的所有import，你看我有哪些依赖库
+import cv2
+import numpy as np
+import pyautogui
+import win32gui
+import os
+import time
+import keyboard
+import sys
+import config
+import tkinter as tk
+
+import cv2
+import os
+import numpy as np
+import pyautogui
+import config
+import win32gui
+import time
+
+import cv2
+import numpy as np
+import pyautogui
+import win32gui
+import os
+import time
+import keyboard
+import sys
+
+from datetime import datetime
+import signal
+import sys
+
+python setup.py build
+
+哦对了，你还记得我们是通过用户输入敌人的方式来选择敌人的吗，我不知道你对于ui.py中EnemySelectorApp的定义是否还有印象：
+    root = tk.Tk()
+    app = EnemySelectorApp(root)
+    root.mainloop()
+    
+    # 获取选择的敌人对象
+    enemy = app.get_selected_enemy()
+然后我们是只有第一次执行main函数的时候会执行下面这段代码，后面我们都默认enemy是不变的了。但是实际上，我们希望完成一场战斗后，自动将enemy置为下一个。
+通常，战斗结束后，屏幕上会有一个标志，对应图片是“img/clocktrain”。我们可以在写一个函数，检测屏幕有没有这个标志，如果有，就点击，然后回车，等一秒，再回车，这样就能进入下一关了，同时我们将enemy置为下一个敌人对象。
+我们目前的enemy如下：
+enemy_options = [
+    "第一站-齿轮", "第二站-波浪", "第三站-怀旧", "第五站-苦行", 
+    "第六站-真理", "第七站-羽化", "第九站-白化", "第十站-洗脑", 
+    "第十一站-煤灯", "最终战-螺旋"
+]
+
+enemy_image_paths = {
+    "第一站-齿轮": resource_path("img/enemies/Mermaid"),
+    "第二站-波浪": resource_path("img/enemies/DreamDevouring"),
+    "第三站-怀旧": resource_path("img/enemies/Gossypium"),
+    "第五站-苦行": resource_path("img/enemies/Pearl"),
+    "第六站-真理": resource_path("img/enemies/SkinProphet"),
+    "第七站-羽化": resource_path("img/enemies/ArdorBlossomMoth"),
+    "第九站-白化": resource_path("img/enemies/PirateAndMermaid"),
+    "第十站-洗脑": resource_path("img/enemies/BrainWash"),
+    "第十一站-煤灯": resource_path("img/enemies/Gaslight"),
+    "最终战-螺旋": resource_path("img/enemies/Spiral")
+}
+
+internal_enemy_names = {
+    "第一站-齿轮": "Mermaid",
+    "第二站-波浪": "DreamDevouring",
+    "第三站-怀旧": "Gossypium",
+    "第五站-苦行": "Pearl",
+    "第六站-真理": "SkinProphet",
+    "第七站-羽化": "ArdorBlossomMoth",
+    "第九站-白化": "PirateAndMermaid",
+    "第十站-洗脑": "BrainWash",
+    "第十一站-煤灯": "Gaslight",
+    "最终战-螺旋": "Spiral"
+}
+
+    # 截取游戏窗口的截图
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+    # 使用OpenCV加载游戏窗口截图
+    game_window_image = np.array(game_window_screenshot)
+    game_window_image_gray = cv2.cvtColor(game_window_image, cv2.COLOR_RGB2GRAY)  # 转换为灰度图像
+
+对于这个函数，最后得到按横坐标递减顺序排序的detected_characters后，这个列表的每个元素是一个元组（character, character_position[0]），我希望再增加一个处理，逆序遍历这个列表的每个成员，然后依次将每个成员的character.position改成下面这个列表对应的值[(500,850),(600,850),(700,850),(800,850),(910,850),(1010,850)]，当然对应的character_position[0]也要改成500，600,700,800,910,1010
+def find_character_positions(game_window_image_gray, characters):
+    # 查找指定范围内的人物头像并排序
+    
+    detected_characters = []
+
+    for character in characters:
+        character.position = None
+        character_position = character.detect_position(game_window_image_gray)
+        if character_position:
+            detected_characters.append((character, character_position[0]))
+
+    # 按横坐标递减顺序排序
+    detected_characters.sort(key=lambda x: x[1], reverse=True)
+
+    # 返回排序后的角色实例列表
+    return [char[0] for char in detected_characters]
+
+我认为我是不是可以把截取屏幕的函数放在utils.py里面？
+def get_screen(game_window_handle, selected_region = None):
+    left, top, right, bottom = win32gui.GetWindowRect(game_window_handle)
+    width = right - left
+    height = bottom - top
+
+    game_window_screenshot = pyautogui.screenshot(region=(left, top, width, height))
+
+    game_window_image_gray = cv2.cvtColor(np.array(game_window_screenshot), cv2.COLOR_BGR2GRAY)
+
+    if selected_region:
+        
+selected_region就是只检测特定区域，通常传入的selected_region是检测区域的两个对角点，比如[(0,0),(1600,900)]或者[(500,500),(200,300)]，这个函数返回截取后的图像
+
+对于这个detect_and_click_icon函数，有时候会识别不出来，所以我决定采取另一种方法。实际上，我们在ctrl+b和ctrl+r后，我们会得到一个名为“兔头人自动坐牢”的窗口，然后我希望点击这个窗口的左下角（准确来说相对于左下角横坐标加40，纵坐标减20）
+
+3.0*x/3 < 2.0 < 3.0 * x / 2 
+x < 2 <1.5x
+4/3 < x < 2
+x< 1.18 < 1.5x
+
+x < 1.52 < 1.5x
